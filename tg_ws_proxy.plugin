@@ -1,0 +1,1136 @@
+import asyncio
+import base64
+import os
+import socket as _socket
+import ssl
+import struct
+import time
+import threading
+import random
+import string
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
+
+from base_plugin import BasePlugin, AppEvent
+from ui.settings import Switch, Header
+from client_utils import get_connections_manager
+from org.telegram.messenger import SharedConfig, NotificationCenter
+
+try:
+    from javax.crypto import Cipher as JavaCipher
+    from javax.crypto.spec import SecretKeySpec, IvParameterSpec
+except ImportError:
+    pass
+
+__id__ = "tg_ws_proxy_plugin"
+__name__ = "tg-ws"
+__description__ = " основано на https://github.com/Flowseal/tg-ws-proxy"
+__author__ = "локальный SOCKS5 прокси плагин"
+__version__ = "1.2.0"
+__min_version__ = "11.12.0"
+
+_TCP_NODELAY = True
+_WS_POOL_SIZE = 4
+_WS_POOL_MAX_AGE = 120.0
+_DC_FAIL_COOLDOWN = 60.0
+_IP_FAIL_COOLDOWN = 3600.0
+_WS_FAIL_TIMEOUT  = 2.0
+
+
+PROTO_TAG_ABRIDGED    = b'\xef\xef\xef\xef'
+PROTO_TAG_INTERMEDIATE = b'\xee\xee\xee\xee'
+PROTO_TAG_SECURE      = b'\xdd\xdd\xdd\xdd'
+
+PROTO_ABRIDGED_INT            = 0xEFEFEFEF
+PROTO_INTERMEDIATE_INT        = 0xEEEEEEEE
+PROTO_PADDED_INTERMEDIATE_INT = 0xDDDDDDDD
+_VALID_PROTOS = (PROTO_ABRIDGED_INT, PROTO_INTERMEDIATE_INT,
+                 PROTO_PADDED_INTERMEDIATE_INT)
+
+
+
+DC_DEFAULT_IPS: Dict[int, str] = {
+    1: '149.154.175.50',
+    2: '149.154.167.51',
+    3: '149.154.175.100',
+    4: '149.154.167.91',
+    5: '149.154.171.5',
+}
+
+_TG_RANGES = [
+    (struct.unpack('!I', _socket.inet_aton('185.76.151.0'))[0],
+     struct.unpack('!I', _socket.inet_aton('185.76.151.255'))[0]),
+    (struct.unpack('!I', _socket.inet_aton('149.154.160.0'))[0],
+     struct.unpack('!I', _socket.inet_aton('149.154.175.255'))[0]),
+    (struct.unpack('!I', _socket.inet_aton('91.105.192.0'))[0],
+     struct.unpack('!I', _socket.inet_aton('91.105.193.255'))[0]),
+    (struct.unpack('!I', _socket.inet_aton('91.108.0.0'))[0],
+     struct.unpack('!I', _socket.inet_aton('91.108.255.255'))[0]),
+]
+
+_IP_TO_DC: Dict[str, Tuple[int, bool]] = {
+    '149.154.175.50': (1, False), '149.154.175.51': (1, False),
+    '149.154.175.53': (1, False), '149.154.175.54': (1, False),
+    '149.154.175.52': (1, True),
+    '149.154.167.41': (2, False), '149.154.167.50': (2, False),
+    '149.154.167.51': (2, False), '149.154.167.220': (2, False),
+    '95.161.76.100':  (2, False),
+    '149.154.167.151': (2, True), '149.154.167.222': (2, True),
+    '149.154.167.223': (2, True), '149.154.162.123': (2, True),
+    '149.154.175.100': (3, False), '149.154.175.101': (3, False),
+    '149.154.175.102': (3, True),
+    '149.154.167.91': (4, False), '149.154.167.92': (4, False),
+    '149.154.164.250': (4, True), '149.154.166.120': (4, True),
+    '149.154.166.121': (4, True), '149.154.167.118': (4, True),
+    '149.154.165.111': (4, True),
+    '91.108.56.100': (5, False), '91.108.56.101': (5, False),
+    '91.108.56.116': (5, False), '91.108.56.126': (5, False),
+    '149.154.171.5':  (5, False),
+    '91.108.56.102': (5, True), '91.108.56.128': (5, True),
+    '91.108.56.151': (5, True),
+    '91.105.192.100': (203, False),
+}
+
+
+
+_ws_blacklist:  Set[str]         = set()
+_dc_fail_until: Dict[str, float] = {}
+_ip_fail_until: Dict[str, float] = {}   
+
+
+
+_CFPROXY_ENC: List[str] = [
+    'virkgj.com', 'vmmzovy.com', 'mkuosckvso.com', 'zaewayzmplad.com',
+    'twdmbzcm.com', 'awzwsldi.com', 'clngqrflngqin.com', 'tjacxbqtj.com',
+    'bxaxtxmrw.com', 'dmohrsgmohcrwb.com', 'vwbmtmoi.com', 'khgrre.com',
+    'ulihssf.com', 'tmhqsdqmfpmk.com', 'xwuwoqbm.com', 'orgcnunpj.com',
+    'zhkuldz.com', 'zypoljnslxa.com', 'efabnxaowuzs.com', 'zaftuzsftqdq.com',
+]
+_S = ''.join(chr(c) for c in (46, 99, 111, 46, 117, 107))
+
+def _dd(s: str) -> str:
+    if s[-4:] != '.com':
+        return s
+    p = s[:-4]
+    n = sum(c.isalpha() for c in p)
+    return ''.join(
+        chr((ord(c) - (97 if c > '`' else 65) - n) % 26
+            + (97 if c > '`' else 65))
+        if c.isalpha() else c for c in p
+    ) + _S
+
+_CFPROXY_DOMAINS: List[str] = [_dd(d) for d in _CFPROXY_ENC]
+
+CFPROXY_DOMAINS_URL = (
+    'https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main'
+    '/.github/cfproxy-domains.txt'
+)
+
+def _start_cfproxy_domain_refresh():
+    
+    def _loop():
+        while True:
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    CFPROXY_DOMAINS_URL + '?' + ''.join(
+                        random.choices(string.ascii_letters, k=7)),
+                    headers={'User-Agent': 'tg-ws-proxy'})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    text = r.read().decode('utf-8', errors='replace')
+                enc = [l.strip() for l in text.splitlines()
+                       if l.strip() and not l.startswith('#')]
+                decoded = [_dd(d) for d in enc]
+                if len(decoded) >= 3:
+                    global _CFPROXY_DOMAINS
+                    _CFPROXY_DOMAINS = decoded
+                    _balancer.update_domains_list(decoded)
+            except Exception:
+                pass
+            time.sleep(3600)
+    threading.Thread(target=_loop, daemon=True,
+                     name='cfproxy-domains-refresh').start()
+
+
+
+class _Balancer:
+    def __init__(self):
+        self.domains: List[str] = []
+        self._dc_domain: Dict[int, str] = {}
+
+    def update_domains_list(self, domains: List[str]):
+        self.domains = domains[:]
+        for dc in (1, 2, 3, 4, 5):
+            if dc not in self._dc_domain or self._dc_domain[dc] not in domains:
+                self._dc_domain[dc] = random.choice(domains)
+
+    def update_domain_for_dc(self, dc: int, domain: str) -> bool:
+        if self._dc_domain.get(dc) == domain:
+            return False
+        self._dc_domain[dc] = domain
+        return True
+
+    def get_domains_for_dc(self, dc: int):
+        cur = self._dc_domain.get(dc)
+        if cur:
+            yield cur
+        pool = self.domains[:]
+        random.shuffle(pool)
+        for d in pool:
+            if d != cur:
+                yield d
+
+_balancer = _Balancer()
+_balancer.update_domains_list(_CFPROXY_DOMAINS)
+
+
+
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode = ssl.CERT_NONE
+
+
+
+def _set_sock_opts(transport):
+    sock = transport.get_extra_info('socket')
+    if sock is None:
+        return
+    if _TCP_NODELAY:
+        try:
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 15)
+        sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 5)
+        sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3)
+    except Exception:
+        pass
+
+def _get_java_cipher(key_raw: bytes, iv: bytes):
+    sk  = SecretKeySpec(key_raw, "AES")
+    ivs = IvParameterSpec(iv)
+    c   = JavaCipher.getInstance("AES/CTR/NoPadding")
+    c.init(JavaCipher.ENCRYPT_MODE, sk, ivs)
+    return c
+
+def _is_telegram_ip(ip: str) -> bool:
+    try:
+        n = struct.unpack('!I', _socket.inet_aton(ip))[0]
+        return any(lo <= n <= hi for lo, hi in _TG_RANGES)
+    except OSError:
+        return False
+
+def _is_http_transport(data: bytes) -> bool:
+    return data.startswith((b'POST ', b'GET ', b'HEAD ', b'OPTIONS '))
+
+def _ws_domains(dc: int, is_media: bool) -> List[str]:
+    d = 2 if dc == 203 else dc
+    if is_media:
+        return [f'kws{d}-1.web.telegram.org', f'kws{d}.web.telegram.org']
+    return [f'kws{d}.web.telegram.org', f'kws{d}-1.web.telegram.org']
+
+def _dc_key(dc: int, is_media: bool) -> str:
+    return f"{dc}{'m' if is_media else ''}"
+
+def _socks5_reply(code: int) -> bytes:
+    return bytes([0x05, code, 0x00, 0x01]) + b'\x00' * 6
+
+
+def _dc_from_init(data: bytes) -> Tuple[Optional[int], bool, int]:
+    
+    try:
+        cipher = _get_java_cipher(bytes(data[8:40]), bytes(data[40:56]))
+        ks = bytes(cipher.update(b'\x00' * 64))
+        plain    = bytes(a ^ b for a, b in zip(data[56:64], ks[56:64]))
+        protocol = struct.unpack('<I', plain[0:4])[0]
+        dc_raw   = struct.unpack('<h', plain[4:6])[0]
+        if protocol in _VALID_PROTOS:
+            dc = abs(dc_raw)
+            if 1 <= dc <= 1000:
+                return dc, (dc_raw < 0), protocol
+    except Exception:
+        pass
+    return None, False, 0
+
+def _patch_init_dc(data: bytes, dc: int) -> bytes:
+    if len(data) < 64:
+        return data
+    new_dc = struct.pack('<h', dc)
+    try:
+        cipher = _get_java_cipher(bytes(data[8:40]), bytes(data[40:56]))
+        ks = bytes(cipher.update(b'\x00' * 64))
+        patched = bytearray(data[:64])
+        patched[60] = ks[60] ^ new_dc[0]
+        patched[61] = ks[61] ^ new_dc[1]
+        return bytes(patched) + data[64:]
+    except Exception:
+        return data
+
+
+
+class MsgSplitter:
+
+    __slots__ = ('_dec', '_proto', '_cipher_buf', '_plain_buf', '_disabled')
+
+    def __init__(self, init_data: bytes, proto_int: int):
+        self._dec = _get_java_cipher(bytes(init_data[8:40]),
+                                      bytes(init_data[40:56]))
+        self._dec.update(b'\x00' * 64)   
+        self._proto      = proto_int
+        self._cipher_buf = bytearray()
+        self._plain_buf  = bytearray()
+        self._disabled   = False
+
+    def split(self, chunk: bytes) -> List[bytes]:
+        if not chunk:
+            return []
+        if self._disabled:
+            return [chunk]
+
+        plain = self._dec.update(chunk)
+        self._cipher_buf.extend(chunk)
+        self._plain_buf.extend(bytes(plain) if plain else b'')
+
+        parts  = []
+        offset = 0
+        buf_len = len(self._cipher_buf)
+
+        while offset < buf_len:
+            plen = self._next_packet_len(offset, buf_len - offset)
+            if plen is None:
+                break
+            if plen <= 0:
+                parts.append(bytes(self._cipher_buf[offset:]))
+                offset = buf_len
+                self._disabled = True
+                break
+            parts.append(bytes(self._cipher_buf[offset:offset + plen]))
+            offset += plen
+
+        if offset:
+            del self._cipher_buf[:offset]
+            del self._plain_buf[:offset]
+
+        return parts
+
+    def flush(self) -> List[bytes]:
+        
+        if not self._cipher_buf:
+            return []
+        tail = bytes(self._cipher_buf)
+        self._cipher_buf.clear()
+        self._plain_buf.clear()
+        return [tail]
+
+    def _next_packet_len(self, offset: int, avail: int) -> Optional[int]:
+        if avail <= 0:
+            return None
+        if self._proto == PROTO_ABRIDGED_INT:
+            return self._next_abridged_len(offset, avail)
+        if self._proto in (PROTO_INTERMEDIATE_INT,
+                           PROTO_PADDED_INTERMEDIATE_INT):
+            return self._next_intermediate_len(offset, avail)
+        return 0
+
+    def _next_abridged_len(self, offset: int, avail: int) -> Optional[int]:
+        first = self._plain_buf[offset]
+        if first in (0x7F, 0xFF):
+            if avail < 4:
+                return None
+            payload = int.from_bytes(
+                self._plain_buf[offset + 1:offset + 4], 'little') * 4
+            hdr = 4
+        else:
+            payload = (first & 0x7F) * 4
+            hdr = 1
+        if payload <= 0:
+            return 0
+        total = hdr + payload
+        return None if avail < total else total
+
+    def _next_intermediate_len(self, offset: int, avail: int) -> Optional[int]:
+        if avail < 4:
+            return None
+        payload = struct.unpack_from('<I', self._plain_buf, offset)[0] & 0x7FFFFFFF
+        if payload <= 0:
+            return 0
+        total = 4 + payload
+        return None if avail < total else total
+
+
+
+class WsHandshakeError(Exception):
+    def __init__(self, status_code: int, status_line: str,
+                 headers: dict = None, location: str = None):
+        self.status_code = status_code
+        self.status_line = status_line
+        self.headers  = headers or {}
+        self.location = location
+        super().__init__(f"HTTP {status_code}: {status_line}")
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in (301, 302, 303, 307, 308)
+
+def _xor_mask(data: bytes, mask: bytes) -> bytes:
+    if not data:
+        return data
+    n   = len(data)
+    rep = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, 'big') ^
+            int.from_bytes(rep,  'big')).to_bytes(n, 'big')
+
+class RawWebSocket:
+    OP_BINARY = 0x2
+    OP_CLOSE  = 0x8
+    OP_PING   = 0x9
+    OP_PONG   = 0xA
+
+    def __init__(self, reader, writer):
+        self.reader  = reader
+        self.writer  = writer
+        self._closed = False
+
+    @staticmethod
+    async def connect(ip: str, domain: str, path: str = '/apiws',
+                      timeout: float = 20.0,
+                      sni: Optional[str] = None) -> 'RawWebSocket':
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, 443, ssl=_ssl_ctx,
+                                    server_hostname=(sni or domain),
+                                    limit=1048576),
+            timeout=timeout)
+        _set_sock_opts(writer.transport)
+
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        writer.write((
+            f'GET {path} HTTP/1.1\r\n'
+            f'Host: {domain}\r\n'
+            f'Upgrade: websocket\r\n'
+            f'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Key: {ws_key}\r\n'
+            f'Sec-WebSocket-Version: 13\r\n'
+            f'Sec-WebSocket-Protocol: binary\r\n'
+            f'Origin: https://web.telegram.org\r\n'
+            f'User-Agent: Mozilla/5.0 (Android 14; Mobile; rv:125.0) '
+            f'Gecko/125.0 Firefox/125.0\r\n\r\n'
+        ).encode())
+        await writer.drain()
+
+        lines = []
+        try:
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                if line in (b'\r\n', b'\n', b''):
+                    break
+                lines.append(line.decode('utf-8', errors='replace').strip())
+        except asyncio.TimeoutError:
+            writer.close()
+            raise
+
+        if not lines:
+            writer.close()
+            raise WsHandshakeError(0, 'empty response')
+
+        parts = lines[0].split(' ', 2)
+        try:
+            code = int(parts[1]) if len(parts) >= 2 else 0
+        except ValueError:
+            code = 0
+
+        if code == 101:
+            return RawWebSocket(reader, writer)
+
+        hdrs = {}
+        for h in lines[1:]:
+            if ':' in h:
+                k, v = h.split(':', 1)
+                hdrs[k.strip().lower()] = v.strip()
+        writer.close()
+        raise WsHandshakeError(code, lines[0], hdrs, hdrs.get('location'))
+
+    async def send(self, data: bytes):
+        if self._closed:
+            raise ConnectionError("WebSocket closed")
+        self.writer.write(self._frame(data))
+        if self.writer.transport.get_write_buffer_size() > 65536:
+            await self.writer.drain()
+
+    async def send_batch(self, parts: List[bytes]):
+        if self._closed:
+            raise ConnectionError("WebSocket closed")
+        for p in parts:
+            self.writer.write(self._frame(p))
+        if self.writer.transport.get_write_buffer_size() > 65536:
+            await self.writer.drain()
+
+    async def recv(self) -> Optional[bytes]:
+        while not self._closed:
+            op, payload = await self._read_frame()
+            if op == self.OP_CLOSE:
+                self._closed = True
+                try:
+                    self.writer.write(self._frame(payload[:2], op=self.OP_CLOSE))
+                    await self.writer.drain()
+                except Exception:
+                    pass
+                return None
+            if op == self.OP_PING:
+                try:
+                    self.writer.write(self._frame(payload, op=self.OP_PONG))
+                    await self.writer.drain()
+                except Exception:
+                    pass
+                continue
+            if op == self.OP_PONG:
+                continue
+            return payload
+        return None
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.writer.write(self._frame(b'', op=self.OP_CLOSE))
+            await self.writer.drain()
+        except Exception:
+            pass
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+
+    def _frame(self, data: bytes, op: int = 0x2) -> bytes:
+        hdr = bytearray([0x80 | op])
+        n   = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack('>H', n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack('>Q', n)
+        mask = os.urandom(4)
+        hdr += mask
+        return bytes(hdr) + _xor_mask(data, mask)
+
+    async def _read_frame(self) -> Tuple[int, bytes]:
+        hdr = await self.reader.readexactly(2)
+        op, is_masked, plen = hdr[0] & 0x0F, bool(hdr[1] & 0x80), hdr[1] & 0x7F
+        if plen == 126:
+            plen = struct.unpack('>H', await self.reader.readexactly(2))[0]
+        elif plen == 127:
+            plen = struct.unpack('>Q', await self.reader.readexactly(8))[0]
+        if is_masked:
+            mask = await self.reader.readexactly(4)
+            return op, _xor_mask(await self.reader.readexactly(plen), mask)
+        return op, await self.reader.readexactly(plen)
+
+
+
+class _WsPool:
+    def __init__(self):
+        self._idle:      Dict[Tuple[int, bool], list] = {}
+        self._refilling: Set[Tuple[int, bool]]        = set()
+
+    async def get(self, dc: int, is_media: bool,
+                  target_ip: str, domains: List[str]) -> Optional[RawWebSocket]:
+        key = (dc, is_media)
+        now = time.monotonic()
+        bucket = self._idle.get(key, [])
+        while bucket:
+            ws, ts = bucket.pop(0)
+            if now - ts > _WS_POOL_MAX_AGE or ws._closed:
+                asyncio.create_task(self._close(ws))
+                continue
+            self._schedule_refill(key, target_ip, domains)
+            return ws
+        self._schedule_refill(key, target_ip, domains)
+        return None
+
+    def report_success(self, dc: int, is_media: bool):
+        pass  
+
+    def _schedule_refill(self, key, target_ip, domains):
+        if key in self._refilling:
+            return
+        self._refilling.add(key)
+        asyncio.create_task(self._refill(key, target_ip, domains))
+
+    async def _refill(self, key, target_ip, domains):
+        try:
+            bucket = self._idle.setdefault(key, [])
+            needed = _WS_POOL_SIZE - len(bucket)
+            if needed <= 0:
+                return
+            tasks = [asyncio.create_task(self._connect_one(target_ip, domains))
+                     for _ in range(needed)]
+            for t in tasks:
+                try:
+                    ws = await t
+                    if ws:
+                        bucket.append((ws, time.monotonic()))
+                except Exception:
+                    pass
+        finally:
+            self._refilling.discard(key)
+
+    @staticmethod
+    async def _connect_one(target_ip, domains) -> Optional[RawWebSocket]:
+        for domain in domains:
+            
+            try:
+                return await RawWebSocket.connect(
+                    target_ip, domain, timeout=7, sni='sprinthost.ru')
+            except Exception:
+                pass
+            
+            try:
+                return await RawWebSocket.connect(target_ip, domain, timeout=8)
+            except WsHandshakeError as exc:
+                if exc.is_redirect:
+                    continue
+                return None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    async def _close(ws):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    async def warmup(self, dc_opt: Dict[int, str]):
+        for dc, target_ip in dc_opt.items():
+            if not target_ip:
+                continue
+            for is_media in (False, True):
+                self._schedule_refill((dc, is_media), target_ip,
+                                      _ws_domains(dc, is_media))
+
+_ws_pool = _WsPool()
+
+
+class _CfWorkerPool:
+    MAX_AGE = 100.0
+    PER_DC  = 1
+
+    def __init__(self):
+        self._idle:      Dict[int, list] = {}
+        self._refilling: Set[int]        = set()
+        self._worker_domains: List[str]  = []
+
+    def set_domains(self, domains: List[str]):
+        self._worker_domains = domains[:]
+
+    def available_domains(self) -> List[str]:
+        pool = self._worker_domains[:]
+        random.shuffle(pool)
+        return pool
+
+    async def get(self, dc: int,
+                  fallback_ip: str) -> Optional[Tuple[RawWebSocket, str]]:
+        if not self._worker_domains:
+            return None
+        now    = time.monotonic()
+        bucket = self._idle.setdefault(dc, [])
+        while bucket:
+            ws, ts, wdomain = bucket.pop(0)
+            if now - ts > self.MAX_AGE or ws._closed:
+                asyncio.create_task(self._close(ws))
+                continue
+            self._schedule_refill(dc, fallback_ip)
+            return ws, wdomain
+        self._schedule_refill(dc, fallback_ip)
+        return None
+
+    def _schedule_refill(self, dc, fallback_ip):
+        if dc in self._refilling or not self._worker_domains:
+            return
+        self._refilling.add(dc)
+        asyncio.create_task(self._refill(dc, fallback_ip))
+
+    async def _refill(self, dc, fallback_ip):
+        try:
+            bucket = self._idle.setdefault(dc, [])
+            if len(bucket) >= self.PER_DC:
+                return
+            result = await self._connect_one(fallback_ip, dc)
+            if result:
+                ws, wdomain = result
+                bucket.append((ws, time.monotonic(), wdomain))
+        finally:
+            self._refilling.discard(dc)
+
+    async def _connect_one(self, fallback_ip: str,
+                           dc: int) -> Optional[Tuple[RawWebSocket, str]]:
+        query = urlencode({'dst': fallback_ip, 'dc': str(dc)})
+        path  = f'/apiws?{query}'
+        for wdomain in self.available_domains():
+            try:
+                ws = await RawWebSocket.connect(
+                    wdomain, wdomain, path=path, timeout=8)
+                return ws, wdomain
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    async def _close(ws):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+_cf_worker_pool = _CfWorkerPool()
+
+
+async def _bridge_ws(local_reader, local_writer, ws: RawWebSocket,
+                     splitter: Optional[MsgSplitter] = None):
+    
+    async def tcp_to_ws():
+        try:
+            while True:
+                chunk = await local_reader.read(65536)
+                if not chunk:
+                    
+                    if splitter:
+                        tail = splitter.flush()
+                        if tail:
+                            await ws.send(tail[0])
+                    break
+                if splitter:
+                    parts = splitter.split(chunk)
+                    if not parts:
+                        continue
+                    if len(parts) > 1:
+                        await ws.send_batch(parts)
+                    else:
+                        await ws.send(parts[0])
+                else:
+                    await ws.send(chunk)
+        except Exception:
+            pass
+
+    async def ws_to_tcp():
+        try:
+            while True:
+                data = await ws.recv()
+                if data is None:
+                    break
+                local_writer.write(data)
+                if local_writer.transport.get_write_buffer_size() > 65536:
+                    await local_writer.drain()
+        except Exception:
+            pass
+
+    tasks = [asyncio.create_task(tcp_to_ws()),
+             asyncio.create_task(ws_to_tcp())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except Exception:
+                pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        try:
+            local_writer.close()
+            await local_writer.wait_closed()
+        except Exception:
+            pass
+
+async def _bridge_tcp(local_reader, local_writer, remote_reader, remote_writer):
+    async def fwd(src, dst):
+        try:
+            while True:
+                data = await src.read(65536)
+                if not data:
+                    break
+                dst.write(data)
+                if dst.transport.get_write_buffer_size() > 65536:
+                    await dst.drain()
+        except Exception:
+            pass
+
+    tasks = [asyncio.create_task(fwd(local_reader, remote_writer)),
+             asyncio.create_task(fwd(remote_reader, local_writer))]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        for w in (local_writer, remote_writer):
+            try:
+                w.close()
+                await w.wait_closed()
+            except Exception:
+                pass
+
+
+
+async def _do_fallback(local_reader, local_writer,
+                       init_data: bytes,
+                       dc: int, is_media: bool,
+                       splitter: Optional[MsgSplitter]) -> bool:
+    fallback_ip = DC_DEFAULT_IPS.get(dc)
+    if not fallback_ip:
+        return False
+
+    
+    pooled = await _cf_worker_pool.get(dc, fallback_ip)
+    if pooled:
+        ws, _ = pooled
+        await ws.send(init_data)
+        await _bridge_ws(local_reader, local_writer, ws, splitter=None)
+        return True
+
+    
+    query = urlencode({'dst': fallback_ip, 'dc': str(dc)})
+    path  = f'/apiws?{query}'
+    for wdomain in _cf_worker_pool.available_domains():
+        try:
+            ws = await RawWebSocket.connect(wdomain, wdomain, path=path, timeout=10)
+            await ws.send(init_data)
+            await _bridge_ws(local_reader, local_writer, ws, splitter=None)
+            return True
+        except Exception:
+            continue
+
+
+    chosen_domain = None
+    ws = None
+    for base_domain in _balancer.get_domains_for_dc(dc):
+        domain = f'kws{dc}.{base_domain}'
+        try:
+            ws = await RawWebSocket.connect(domain, domain, timeout=10)
+            chosen_domain = base_domain
+            break
+        except Exception:
+            continue
+
+    if ws is not None:
+        if chosen_domain:
+            _balancer.update_domain_for_dc(dc, chosen_domain)
+        await ws.send(init_data)
+        await _bridge_ws(local_reader, local_writer, ws, splitter)
+        return True
+
+
+    try:
+        rr, rw = await asyncio.wait_for(
+            asyncio.open_connection(fallback_ip, 443, limit=1048576),
+            timeout=10)
+        rw.write(init_data)
+        await rw.drain()
+        await _bridge_tcp(local_reader, local_writer, rr, rw)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+class WsProxyPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.proxy_thread = None
+        self.loop = None
+        self.server = None
+        self.default_port = 1081
+        
+        self.dc_opt: Dict[int, str] = DC_DEFAULT_IPS.copy()
+
+    def enable_client_proxy(self, port: int):
+        try:
+            SharedConfig.loadProxyList()
+            proxy_info = SharedConfig.ProxyInfo("127.0.0.1", port, "", "", "")
+            SharedConfig.addProxy(proxy_info)
+            SharedConfig.currentProxy = proxy_info
+            SharedConfig.saveConfig()
+        except Exception:
+            pass
+        try:
+            cm = get_connections_manager()
+            cm.setProxySettings(True, "127.0.0.1", port, "", "", "")
+            NotificationCenter.getGlobalInstance().postNotificationName(
+                NotificationCenter.proxySettingsChanged)
+        except Exception:
+            pass
+
+    def disable_client_proxy(self):
+        try:
+            if (SharedConfig.currentProxy and
+                    SharedConfig.currentProxy.address == "127.0.0.1"):
+                SharedConfig.currentProxy = None
+                SharedConfig.saveConfig()
+        except Exception:
+            pass
+        try:
+            cm = get_connections_manager()
+            cm.setProxySettings(False, "", 0, "", "", "")
+            NotificationCenter.getGlobalInstance().postNotificationName(
+                NotificationCenter.proxySettingsChanged)
+        except Exception:
+            pass
+
+    def on_plugin_load(self):
+        _start_cfproxy_domain_refresh()
+        self.proxy_thread = threading.Thread(
+            target=self.run_proxy_server, args=(self.default_port,), daemon=True)
+        self.proxy_thread.start()
+        threading.Timer(0.5, lambda: self.enable_client_proxy(
+            self.default_port)).start()
+
+    def on_app_event(self, event_type: AppEvent):
+        if event_type in (AppEvent.START, AppEvent.RESUME):
+            self.enable_client_proxy(self.default_port)
+
+    def on_plugin_unload(self):
+        self.disable_client_proxy()
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.stop_server_internal)
+        if self.proxy_thread:
+            self.proxy_thread.join(timeout=2.0)
+
+    def stop_server_internal(self):
+        if self.server:
+            self.server.close()
+        for task in asyncio.all_tasks(self.loop):
+            task.cancel()
+        self.loop.stop()
+
+    def run_proxy_server(self, port: int):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.create_task(_ws_pool.warmup(self.dc_opt))
+        try:
+            self.server = self.loop.run_until_complete(
+                asyncio.start_server(self.handle_client, '127.0.0.1', port,
+                                     limit=1048576))
+            self.loop.run_forever()
+        except Exception:
+            pass
+        finally:
+            self.loop.close()
+
+    def create_settings(self) -> list:
+        return [
+            Header(text="Settings WS Proxy"),
+            Switch(key="auto_start", text="Auto start", default=True),
+        ]
+
+    async def handle_client(self, local_reader, local_writer):
+        _set_sock_opts(local_writer.transport)
+        try:
+             
+            hdr = await asyncio.wait_for(local_reader.readexactly(2), timeout=10)
+            if hdr[0] != 5:
+                return
+            await local_reader.readexactly(hdr[1])
+            local_writer.write(b'\x05\x00')
+            await local_writer.drain()
+
+            req = await asyncio.wait_for(local_reader.readexactly(4), timeout=10)
+            _, cmd, _, atype = req
+            if cmd != 1:
+                local_writer.write(_socks5_reply(0x07))
+                await local_writer.drain()
+                return
+
+            if atype == 1:
+                dst_ip = _socket.inet_ntoa(await local_reader.readexactly(4))
+            elif atype == 3:
+                n = (await local_reader.readexactly(1))[0]
+                dst_ip = (await local_reader.readexactly(n)).decode()
+            elif atype == 4:
+                dst_ip = _socket.inet_ntop(_socket.AF_INET6,
+                                            await local_reader.readexactly(16))
+            else:
+                local_writer.write(_socks5_reply(0x08))
+                await local_writer.drain()
+                return
+
+            dst_port = struct.unpack('!H', await local_reader.readexactly(2))[0]
+
+            
+            if not _is_telegram_ip(dst_ip):
+                try:
+                    rr, rw = await asyncio.wait_for(
+                        asyncio.open_connection(dst_ip, dst_port, limit=1048576),
+                        timeout=10)
+                except Exception:
+                    local_writer.write(_socks5_reply(0x05))
+                    await local_writer.drain()
+                    return
+                local_writer.write(_socks5_reply(0x00))
+                await local_writer.drain()
+                await _bridge_tcp(local_reader, local_writer, rr, rw)
+                return
+
+            local_writer.write(_socks5_reply(0x00))
+            await local_writer.drain()
+
+            
+            try:
+                initial_data = await asyncio.wait_for(
+                    local_reader.readexactly(64), timeout=15)
+            except asyncio.IncompleteReadError:
+                return
+
+            if _is_http_transport(initial_data):
+                return
+
+             
+            dc, is_media, proto_int = _dc_from_init(initial_data)
+
+            if dst_ip in _IP_TO_DC:
+                real_dc, real_is_media = _IP_TO_DC[dst_ip]
+                dc       = real_dc
+                is_media = real_is_media
+                initial_data = _patch_init_dc(initial_data,
+                                               -dc if is_media else dc)
+                _, _, proto_int = _dc_from_init(initial_data)
+
+            
+            if dc is None or dc not in self.dc_opt:
+                splitter = None
+                if dc and proto_int in _VALID_PROTOS:
+                    try:
+                        splitter = MsgSplitter(initial_data, proto_int)
+                    except Exception:
+                        pass
+                await _do_fallback(local_reader, local_writer,
+                                   initial_data, dc or 2, is_media or False,
+                                   splitter)
+                return
+
+            key      = _dc_key(dc, is_media)
+            now      = time.monotonic()
+            target   = self.dc_opt[dc]
+            domains  = _ws_domains(dc, is_media)
+            any_cf   = bool(_cf_worker_pool._worker_domains or _balancer.domains)
+
+            
+            if (key in _ws_blacklist
+                    or (now < _ip_fail_until.get(target, 0) and any_cf)):
+
+                if key not in _ws_blacklist:
+                    
+                    ws = await _ws_pool.get(dc, is_media, target, domains)
+                    if ws:
+                        pass  
+                    else:
+                        splitter = None
+                        if proto_int in _VALID_PROTOS:
+                            try:
+                                splitter = MsgSplitter(initial_data, proto_int)
+                            except Exception:
+                                pass
+                        await _do_fallback(local_reader, local_writer,
+                                           initial_data, dc, is_media, splitter)
+                        return
+                else:
+                    splitter = None
+                    if proto_int in _VALID_PROTOS:
+                        try:
+                            splitter = MsgSplitter(initial_data, proto_int)
+                        except Exception:
+                            pass
+                    await _do_fallback(local_reader, local_writer,
+                                       initial_data, dc, is_media, splitter)
+                    return
+
+            
+            ws_timeout = _WS_FAIL_TIMEOUT if now < _dc_fail_until.get(key, 0) else 5.0
+            ws_failed_redirect = False
+            ws_timed_out       = False
+            all_redirects      = True
+
+            ws = await _ws_pool.get(dc, is_media, target, domains)
+
+            if ws is None:
+                for domain in domains:
+                    try:
+                        ws = await RawWebSocket.connect(
+                            target, domain, timeout=ws_timeout)
+                        all_redirects = False
+                        break
+                    except WsHandshakeError as exc:
+                        if exc.is_redirect:
+                            ws_failed_redirect = True
+                            continue
+                        else:
+                            all_redirects = False
+                    except asyncio.TimeoutError:
+                        ws_timed_out = True
+                        break
+                    except Exception:
+                        all_redirects = False
+
+            
+            if ws is None:
+                if ws_timed_out:
+                    _ip_fail_until[target] = now + _IP_FAIL_COOLDOWN
+
+                if ws_failed_redirect and all_redirects:
+                    _ws_blacklist.add(key)
+                else:
+                    _dc_fail_until[key] = now + _DC_FAIL_COOLDOWN
+
+                splitter = None
+                if proto_int in _VALID_PROTOS:
+                    try:
+                        splitter = MsgSplitter(initial_data, proto_int)
+                    except Exception:
+                        pass
+                await _do_fallback(local_reader, local_writer,
+                                   initial_data, dc, is_media, splitter)
+                return
+
+            
+            _ip_fail_until.pop(target, None)
+            _ws_pool.report_success(dc, is_media)
+
+            splitter = None
+            if proto_int in _VALID_PROTOS:
+                try:
+                    splitter = MsgSplitter(initial_data, proto_int)
+                except Exception:
+                    pass
+
+            await ws.send(initial_data)
+            await _bridge_ws(local_reader, local_writer, ws, splitter)
+
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.IncompleteReadError:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                local_writer.close()
+            except Exception:
+                pass
+
+
+class Hook(WsProxyPlugin):
+    pass
+
+__plugin__ = Hook
